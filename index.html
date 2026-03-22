@@ -331,6 +331,779 @@ firebase.initializeApp({
 });
 const db = firebase.database();
 
+const ICE_CONFIG = {
+  iceServers:[
+    {urls:["stun:stun.l.google.com:19302","stun:stun1.l.google.com:19302"]},
+    {urls:"turn:openrelay.metered.ca:80",username:"openrelayproject",credential:"openrelayproject"},
+    {urls:"turn:openrelay.metered.ca:443",username:"openrelayproject",credential:"openrelayproject"},
+    {urls:"turn:openrelay.metered.ca:443?transport=tcp",username:"openrelayproject",credential:"openrelayproject"},
+  ],
+  iceCandidatePoolSize:10
+};
+
+// ── State ──
+let role=null, roomId=null, pc=null, dc=null;
+let localStream=null, isSharing=false;
+let pendingCandidates=[];   // buffer ICE trước khi có remoteDesc
+let remoteDescSet=false;
+let fbListeners=[];         // để cleanup
+
+// ── UI helpers ──
+const $=id=>document.getElementById(id);
+function showScreen(id){
+  document.querySelectorAll('.screen').forEach(s=>s.classList.add('hidden'));
+  $(id).classList.remove('hidden');
+}
+let nT=null;
+function notify(msg,type='info'){
+  const el=$('notif');
+  el.textContent=msg; el.className='notif '+type+' show';
+  if(nT)clearTimeout(nT);
+  nT=setTimeout(()=>el.classList.remove('show'),3500);
+}
+function setLoading(show,text=''){
+  $('loading').classList.toggle('show',show);
+  if(text) $('loading-text').textContent=text;
+}
+
+// ── Role selection ──
+function selectRole(r){
+  role=r;
+  $('role-setup').style.display='block';
+  const btn=$('connect-btn');
+  $('conn-icon').textContent=r==='phone'?'📱':'🖥️';
+  if(r==='phone'){
+    btn.className='conn-btn phone-btn';
+    $('conn-text').textContent='TẠO PHÒNG (ĐIỆN THOẠI)';
+    genRoom();
+  } else {
+    btn.className='conn-btn pc-btn';
+    $('conn-text').textContent='KẾT NỐI (MÁY TÍNH)';
+    $('room-inp').placeholder='Nhập mã phòng từ điện thoại...';
+    $('room-inp').value='';
+    $('room-inp').focus();
+  }
+}
+
+function genRoom(){
+  const chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code='';
+  for(let i=0;i<6;i++) code+=chars[Math.floor(Math.random()*chars.length)];
+  $('room-inp').value=code;
+}
+
+async function connect(){
+  const inp=$('room-inp').value.trim().toUpperCase().replace(/[^A-Z0-9]/g,'');
+  if(!inp||inp.length<4){notify('Nhập mã phòng (tối thiểu 4 ký tự)!','error');return;}
+  roomId=inp;
+  if(role==='phone') await startPhone();
+  else await startPC();
+}
+
+// ── Cleanup Firebase listeners ──
+function cleanupListeners(){
+  fbListeners.forEach(({ref,event,fn})=>ref.off(event,fn));
+  fbListeners=[];
+}
+function fbOn(ref,event,fn){
+  ref.on(event,fn);
+  fbListeners.push({ref,event,fn});
+}
+
+// ── Create PeerConnection ──
+function createPC(){
+  if(pc){ try{pc.close();}catch(e){} }
+  pc = new RTCPeerConnection(ICE_CONFIG);
+  remoteDescSet=false;
+  pendingCandidates=[];
+
+  pc.onconnectionstatechange=()=>{
+    const s=pc.connectionState;
+    console.log('[WebRTC] Connection state:',s);
+    if(s==='connected'){ notify('✅ Kết nối thành công!','success'); }
+    if(s==='disconnected'){ notify('⚠️ Mất kết nối...','warning'); }
+    if(s==='failed'){ notify('❌ Kết nối thất bại — thử lại!','error'); }
+  };
+
+  pc.onicegatheringstatechange=()=>{
+    console.log('[ICE] Gathering:',pc.iceGatheringState);
+  };
+
+  pc.onsignalingstatechange=()=>{
+    console.log('[Signal] State:',pc.signalingState);
+  };
+
+  return pc;
+}
+
+// ── Add ICE candidate safely (buffer if not ready) ──
+async function addCandidate(cand){
+  if(!cand||!cand.candidate) return;
+  if(remoteDescSet && pc){
+    try{ await pc.addIceCandidate(new RTCIceCandidate(cand)); }
+    catch(e){ console.warn('[ICE] addCandidate error:',e); }
+  } else {
+    pendingCandidates.push(cand);
+  }
+}
+
+async function flushPendingCandidates(){
+  const pending=[...pendingCandidates];
+  pendingCandidates=[];
+  for(const cand of pending){
+    try{ await pc.addIceCandidate(new RTCIceCandidate(cand)); }
+    catch(e){ console.warn('[ICE] flush error:',e); }
+  }
+}
+
+// ═══════════════════════
+//  PHONE HOST
+// ═══════════════════════
+async function startPhone(){
+  setLoading(true,'Đang thiết lập phòng...');
+  showScreen('phone-host');
+  $('ph-room-code').textContent=roomId;
+  $('ph-dot').className='sdot connecting';
+  $('ph-status-text').textContent='Đang chuẩn bị...';
+  cleanupListeners();
+
+  // Xóa data cũ
+  await db.ref('rooms/'+roomId).remove();
+  // Đánh dấu phòng tồn tại
+  await db.ref('rooms/'+roomId+'/meta').set({created:Date.now(),host:'phone'});
+
+  createPC();
+
+  // Data channel — phone tạo, PC nhận
+  dc = pc.createDataChannel('control',{ordered:true});
+  dc.onopen =()=>{ notify('📡 Kênh điều khiển mở!','success'); $('ph-dot').className='sdot connected'; };
+  dc.onmessage=e=>{ try{ handlePhoneCommand(JSON.parse(e.data)); }catch(err){} };
+  dc.onclose=()=>{ $('ph-dot').className='sdot connecting'; };
+
+  // ICE → Firebase (phone-ice)
+  pc.onicecandidate=e=>{
+    if(e.candidate){
+      db.ref('rooms/'+roomId+'/phone-ice').push(e.candidate.toJSON());
+    } else {
+      console.log('[ICE] Phone gathering complete');
+    }
+  };
+
+  // Track added → renegotiate
+  pc.onnegotiationneeded=async()=>{
+    try{
+      console.log('[Signal] onnegotiationneeded — phone sending offer');
+      const offer=await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await db.ref('rooms/'+roomId+'/offer').set({
+        sdp:pc.localDescription.sdp,
+        type:pc.localDescription.type,
+        ts:Date.now()
+      });
+    }catch(e){ console.error('[Offer]',e); }
+  };
+
+  // Listen: answer từ PC
+  const ansRef=db.ref('rooms/'+roomId+'/answer');
+  fbOn(ansRef,'value',async snap=>{
+    const ans=snap.val();
+    if(!ans||remoteDescSet) return;
+    if(pc.signalingState==='have-local-offer'){
+      try{
+        await pc.setRemoteDescription(new RTCSessionDescription(ans));
+        remoteDescSet=true;
+        await flushPendingCandidates();
+        notify('📡 PC đã xác nhận kết nối','info');
+        $('ph-dot').className='sdot connected';
+        $('ph-status-text').textContent='Đã kết nối PC ✓';
+        $('ph-waiting').style.display='none';
+      }catch(e){ console.error('[Answer]',e); notify('Lỗi xử lý answer: '+e.message,'error'); }
+    }
+  });
+
+  // Listen: pc-ice candidates
+  const pcIceRef=db.ref('rooms/'+roomId+'/pc-ice');
+  fbOn(pcIceRef,'child_added',async snap=>{ await addCandidate(snap.val()); });
+
+  setLoading(false);
+  notify('📱 Phòng '+roomId+' đã sẵn sàng! Mở PC để kết nối.','success');
+}
+
+async function toggleShare(){
+  if(isSharing){ stopShare(); return; }
+  try{
+    let stream;
+    try{
+      stream=await navigator.mediaDevices.getDisplayMedia({
+        video:{frameRate:{ideal:30,max:30},width:{ideal:1920},height:{ideal:1080}},
+        audio:false
+      });
+    }catch(screenErr){
+      console.warn('getDisplayMedia failed, try camera:',screenErr);
+      notify('Screen share không được, dùng camera...','warning');
+      stream=await navigator.mediaDevices.getUserMedia({
+        video:{facingMode:'environment',width:{ideal:1280},height:{ideal:720},frameRate:30},
+        audio:false
+      });
+    }
+    localStream=stream;
+
+    // Add tracks — this triggers onnegotiationneeded automatically
+    stream.getTracks().forEach(t=>{ pc.addTrack(t,stream); });
+
+    isSharing=true;
+    $('share-btn').className='ph-btn share active';
+    $('share-icon').textContent='🔴';
+    $('share-text').textContent='ĐANG CHIA SẺ';
+    $('share-hint').textContent='Màn hình đang được chia sẻ với PC.';
+    $('ph-dot').className='sdot sharing';
+    $('ph-status-text').textContent='Đang chia sẻ...';
+    notify('📺 Bắt đầu chia sẻ màn hình!','success');
+
+    stream.getVideoTracks()[0].onended=()=>stopShare();
+
+  }catch(e){
+    console.error('[Share]',e);
+    notify('❌ Lỗi: '+e.message,'error');
+  }
+}
+
+function stopShare(){
+  if(localStream) localStream.getTracks().forEach(t=>t.stop());
+  localStream=null; isSharing=false;
+  $('share-btn').className='ph-btn share';
+  $('share-icon').textContent='📺';
+  $('share-text').textContent='CHIA SẺ MÀN HÌNH';
+  $('share-hint').textContent='Nhấn để bắt đầu chia sẻ màn hình.';
+  notify('⏹ Đã dừng chia sẻ','info');
+}
+
+function handlePhoneCommand(cmd){
+  if(cmd.type==='ping'&&dc&&dc.readyState==='open')
+    dc.send(JSON.stringify({type:'pong',ts:cmd.ts}));
+}
+
+// ═══════════════════════
+//  PC VIEWER
+// ═══════════════════════
+async function startPC(){
+  setLoading(true,'Đang tìm phòng '+roomId+'...');
+  showScreen('pc-viewer');
+  $('pv-room-label').textContent=roomId;
+  $('pv-room-show').textContent=roomId;
+  cleanupListeners();
+
+  // Kiểm tra phòng có tồn tại không
+  const meta=await db.ref('rooms/'+roomId+'/meta').get();
+  if(!meta.exists()){
+    setLoading(false);
+    notify('❌ Không tìm thấy phòng "'+roomId+'" — điện thoại tạo phòng chưa?','error');
+    return;
+  }
+
+  createPC();
+
+  // Nhận data channel từ phone
+  pc.ondatachannel=e=>{
+    dc=e.channel;
+    dc.onopen=()=>{ notify('📡 Kênh điều khiển sẵn sàng!','success'); startPing(); };
+    dc.onmessage=e2=>{ try{ const d=JSON.parse(e2.data); if(d.type==='pong') $('pv-stats').textContent='Latency: '+(Date.now()-d.ts)+'ms'; }catch(err){} };
+  };
+
+  // Nhận video stream
+  pc.ontrack=e=>{
+    console.log('[PC] Track received:',e.track.kind);
+    const video=$('remote-video');
+    if(e.streams[0]&&video.srcObject!==e.streams[0]){
+      video.srcObject=e.streams[0];
+      video.onloadedmetadata=()=>{
+        video.play().catch(()=>{});
+        $('pv-overlay').classList.add('hidden');
+        $('cursor').style.display='block';
+        notify('📺 Màn hình điện thoại đã hiển thị!','success');
+        startFPSCounter(video);
+      };
+    }
+  };
+
+  // ICE → Firebase (pc-ice)
+  pc.onicecandidate=e=>{
+    if(e.candidate) db.ref('rooms/'+roomId+'/pc-ice').push(e.candidate.toJSON());
+  };
+
+  // === CORE SIGNALING: lắng nghe offer, tạo answer ===
+  const offerRef=db.ref('rooms/'+roomId+'/offer');
+  let lastOfferTs=0;
+
+  fbOn(offerRef,'value',async snap=>{
+    const offer=snap.val();
+    if(!offer||offer.ts===lastOfferTs) return;
+    lastOfferTs=offer.ts||0;
+    console.log('[PC] Got offer, signalingState:',pc.signalingState);
+
+    try{
+      // Reset nếu cần re-negotiate
+      if(pc.signalingState!=='stable'&&pc.signalingState!=='have-remote-offer'){
+        console.log('[PC] Rollback local desc');
+        await pc.setLocalDescription({type:'rollback'});
+      }
+
+      await pc.setRemoteDescription(new RTCSessionDescription({sdp:offer.sdp,type:offer.type}));
+      remoteDescSet=true;
+      await flushPendingCandidates();
+
+      const answer=await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await db.ref('rooms/'+roomId+'/answer').set({
+        sdp:pc.localDescription.sdp,
+        type:pc.localDescription.type,
+        ts:Date.now()
+      });
+      notify('✅ Đã gửi answer — đang kết nối...','info');
+    }catch(e){
+      console.error('[PC Answer error]',e);
+      notify('Lỗi answer: '+e.message,'error');
+    }
+  });
+
+  // phone-ice candidates
+  const phoneIceRef=db.ref('rooms/'+roomId+'/phone-ice');
+  fbOn(phoneIceRef,'child_added',async snap=>{ await addCandidate(snap.val()); });
+
+  setLoading(false);
+  notify('🔍 Đã tìm thấy phòng! Đang thiết lập kết nối...','info');
+}
+
+// ── Mouse/Touch ──
+function handleMouseMove(e){
+  const rect=e.currentTarget.getBoundingClientRect();
+  const x=e.clientX-rect.left,y=e.clientY-rect.top;
+  const cur=$('cursor');
+  cur.style.left=x+'px'; cur.style.top=y+'px';
+  if(dc&&dc.readyState==='open')
+    dc.send(JSON.stringify({type:'mousemove',x:x/rect.width,y:y/rect.height}));
+}
+function handleClick(e){
+  e.preventDefault();
+  const rect=e.currentTarget.getBoundingClientRect();
+  const pct={x:(e.clientX-rect.left)/rect.width,y:(e.clientY-rect.top)/rect.height};
+  sendCmd({type:'tap',x:pct.x,y:pct.y});
+  spawnRipple(e.clientX,e.clientY,'var(--cyan)');
+  notify('👆 Tap: '+Math.round(pct.x*100)+'%, '+Math.round(pct.y*100)+'%','info');
+}
+function handleRightClick(e){
+  e.preventDefault();
+  const rect=e.currentTarget.getBoundingClientRect();
+  sendCmd({type:'longpress',x:(e.clientX-rect.left)/rect.width,y:(e.clientY-rect.top)/rect.height});
+  spawnRipple(e.clientX,e.clientY,'var(--red)');
+  notify('👆 Long press','info');
+}
+function spawnRipple(x,y,color){
+  const r=document.createElement('div');
+  r.style.cssText=`position:fixed;left:${x}px;top:${y}px;width:20px;height:20px;margin:-10px;border-radius:50%;border:2px solid ${color};pointer-events:none;z-index:9999;animation:ripple .5s ease-out forwards`;
+  document.body.appendChild(r);
+  setTimeout(()=>r.remove(),600);
+}
+
+// ── Commands ──
+function sendCmd(cmd){
+  if(dc&&dc.readyState==='open') dc.send(JSON.stringify(cmd));
+  else notify('⚠️ Chưa có kênh điều khiển (data channel chưa mở)','warning');
+}
+function sendKey(key){ sendCmd({type:'key',key}); notify('⌨️ '+key,'info'); }
+function sendText(text){ if(!text.trim())return; sendCmd({type:'text',value:text}); notify('📝 Gửi: "'+text.substring(0,20)+'"','info'); }
+function sendScroll(dir){ sendCmd({type:'scroll',direction:dir,amount:300}); }
+
+// ── FPS ──
+function startFPSCounter(video){
+  let last=Date.now(),frames=0;
+  const id=setInterval(()=>{
+    const now=Date.now(),el=now-last;
+    if(el>=1000){ $('fps-display').textContent='FPS: '+Math.round(frames*1000/el); frames=0; last=now; }
+    frames++;
+    if(!video.srcObject) clearInterval(id);
+  },33);
+}
+
+// ── Ping ──
+function startPing(){
+  const id=setInterval(()=>{
+    if(!dc||dc.readyState!=='open'){ clearInterval(id); return; }
+    dc.send(JSON.stringify({type:'ping',ts:Date.now()}));
+  },3000);
+}
+
+// ── Keyboard ──
+let kbOpen=false;
+function toggleKeyboard(){
+  kbOpen=!kbOpen;
+  $('kb-panel').classList.toggle('open',kbOpen);
+  if(kbOpen) $('kb-type').focus();
+}
+document.addEventListener('keydown',e=>{
+  if($('pc-viewer').classList.contains('hidden'))return;
+  if(document.activeElement===$('kb-type'))return;
+  sendCmd({type:'key',key:e.key,code:e.code,ctrl:e.ctrlKey,shift:e.shiftKey,alt:e.altKey});
+});
+
+// ── Quality ──
+function setQuality(btn,q){
+  document.querySelectorAll('.q-btn').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+}
+
+// ── Fullscreen ──
+function toggleFullscreen(){
+  const el=$('pv-body');
+  if(!document.fullscreenElement) el.requestFullscreen().catch(e=>notify('Lỗi: '+e.message,'error'));
+  else document.exitFullscreen();
+}
+
+// ── Go home ──
+function goHome(){
+  cleanupListeners();
+  if(pc){ try{pc.close();}catch(e){} pc=null; }
+  if(dc){ try{dc.close();}catch(e){} dc=null; }
+  if(localStream){ localStream.getTracks().forEach(t=>t.stop()); localStream=null; }
+  if(roomId){ db.ref('rooms/'+roomId).remove(); }
+  isSharing=false; role=null; roomId=null; remoteDescSet=false; pendingCandidates=[];
+  showScreen('home');
+  $('role-setup').style.display='none';
+  $('pv-overlay').classList.remove('hidden');
+  $('remote-video').srcObject=null;
+  notify('Đã ngắt kết nối','info');
+}
+
+// Ripple CSS
+const s=document.createElement('style');
+s.textContent='@keyframes ripple{to{transform:scale(4);opacity:0}}';
+document.head.appendChild(s);
+</script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
+<style>
+:root{
+  --bg:#04060f;--card:#0c0e1e;--card2:#111428;
+  --cyan:#00f5d4;--cyang:rgba(0,245,212,.18);
+  --red:#ff3560;--redg:rgba(255,53,96,.25);
+  --gold:#ffd166;--purple:#b48eff;
+  --green:#06d6a0;--blue:#4cc9f0;
+  --text:#ccd6f6;--dim:#4a5280;
+  --b:rgba(0,245,212,.12);--br:rgba(255,53,96,.18);
+  --t:.18s ease;
+}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;font-family:'Rajdhani',sans-serif;background:var(--bg);color:var(--text);overflow:hidden}
+
+/* BG FX */
+body::before{content:'';position:fixed;inset:0;
+  background: radial-gradient(ellipse at 20% 50%,rgba(0,245,212,.04) 0%,transparent 60%),
+              radial-gradient(ellipse at 80% 20%,rgba(180,142,255,.04) 0%,transparent 50%);
+  pointer-events:none;z-index:0}
+body::after{content:'';position:fixed;inset:0;
+  background-image:linear-gradient(rgba(0,245,212,.025) 1px,transparent 1px),
+                   linear-gradient(90deg,rgba(0,245,212,.025) 1px,transparent 1px);
+  background-size:40px 40px;pointer-events:none;z-index:0}
+
+/* ── SCREENS ── */
+.screen{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:10;transition:opacity .35s}
+.screen.hidden{opacity:0;pointer-events:none}
+
+/* ── HOME ── */
+#home{flex-direction:column;gap:0;padding:20px}
+.home-inner{width:100%;max-width:520px;text-align:center}
+.logo{font-family:'Orbitron',monospace;font-size:clamp(28px,6vw,44px);font-weight:900;letter-spacing:3px;line-height:1.1;margin-bottom:8px}
+.logo .c{color:var(--cyan)}.logo .r{color:var(--red)}
+.logo-sub{font-size:11px;letter-spacing:5px;color:var(--dim);text-transform:uppercase;margin-bottom:10px}
+.logo-desc{font-size:13px;color:var(--text);line-height:1.7;margin-bottom:36px;opacity:.8}
+
+.mode-cards{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:24px}
+.mcard{padding:28px 20px;border-radius:16px;border:1px solid;cursor:pointer;transition:var(--t);position:relative;overflow:hidden;text-align:center}
+.mcard::before{content:'';position:absolute;inset:0;opacity:0;transition:opacity .25s}
+.mcard:hover::before{opacity:1}
+.mcard:hover{transform:translateY(-3px)}
+.mcard.phone{border-color:var(--br);background:rgba(255,53,96,.06)}
+.mcard.phone::before{background:rgba(255,53,96,.08)}
+.mcard.phone:hover{border-color:var(--red);box-shadow:0 8px 32px var(--redg)}
+.mcard.pc{border-color:var(--b);background:rgba(0,245,212,.04)}
+.mcard.pc::before{background:rgba(0,245,212,.06)}
+.mcard.pc:hover{border-color:var(--cyan);box-shadow:0 8px 32px var(--cyang)}
+.mcard-icon{font-size:40px;margin-bottom:12px;display:block;filter:drop-shadow(0 0 12px currentColor)}
+.mcard.phone .mcard-icon{color:var(--red)}
+.mcard.pc .mcard-icon{color:var(--cyan)}
+.mcard-title{font-family:'Orbitron',monospace;font-size:13px;font-weight:700;letter-spacing:2px;margin-bottom:6px}
+.mcard.phone .mcard-title{color:var(--red)}
+.mcard.pc .mcard-title{color:var(--cyan)}
+.mcard-desc{font-size:11px;color:var(--dim);line-height:1.5}
+
+.room-row{display:flex;gap:10px;margin-bottom:12px}
+.room-inp{flex:1;background:var(--card);border:1px solid var(--b);border-radius:10px;padding:12px 16px;color:var(--cyan);font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:600;letter-spacing:3px;text-align:center;outline:none;transition:var(--t);text-transform:uppercase}
+.room-inp::placeholder{color:var(--dim);letter-spacing:1px;font-size:13px;text-transform:none}
+.room-inp:focus{border-color:var(--cyan);box-shadow:0 0 0 3px var(--cyang)}
+.gen-btn{padding:12px 16px;background:rgba(0,245,212,.1);border:1px solid var(--b);border-radius:10px;color:var(--cyan);cursor:pointer;font-size:18px;transition:var(--t)}
+.gen-btn:hover{background:rgba(0,245,212,.2)}
+
+.conn-btn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:14px;border-radius:12px;border:none;font-family:'Orbitron',monospace;font-size:13px;font-weight:700;letter-spacing:2px;cursor:pointer;transition:var(--t)}
+.conn-btn.phone-btn{background:linear-gradient(135deg,#ff3560,#ff6b8a);color:#fff}
+.conn-btn.phone-btn:hover{box-shadow:0 6px 24px var(--redg);transform:translateY(-2px)}
+.conn-btn.pc-btn{background:linear-gradient(135deg,#00f5d4,#00c9a7);color:#0a0f1a}
+.conn-btn.pc-btn:hover{box-shadow:0 6px 24px var(--cyang);transform:translateY(-2px)}
+
+/* ── PHONE HOST ── */
+#phone-host{flex-direction:column;background:var(--bg)}
+.ph-header{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;background:var(--card);border-bottom:1px solid var(--br);flex-shrink:0;z-index:2}
+.ph-title{font-family:'Orbitron',monospace;font-size:12px;font-weight:700;letter-spacing:2px;color:var(--red)}
+.ph-status{display:flex;align-items:center;gap:7px;font-size:11px;font-weight:700;letter-spacing:1px}
+.sdot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex-shrink:0}
+.sdot.connecting{background:var(--gold);animation:pulse 1.2s infinite}
+.sdot.connected{background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 2s infinite}
+.sdot.sharing{background:var(--cyan);box-shadow:0 0 8px var(--cyan);animation:pulse 1.5s infinite}
+
+.ph-body{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;gap:20px;overflow-y:auto}
+.ph-room-display{text-align:center}
+.room-label{font-size:10px;letter-spacing:3px;color:var(--dim);text-transform:uppercase;margin-bottom:6px}
+.room-code{font-family:'Orbitron',monospace;font-size:36px;font-weight:900;color:var(--cyan);letter-spacing:8px;text-shadow:0 0 20px var(--cyang)}
+
+.ph-waiting{text-align:center;padding:20px}
+.ph-waiting-icon{font-size:56px;margin-bottom:14px;animation:float 2.5s ease-in-out infinite}
+.ph-waiting-text{font-size:14px;color:var(--dim);line-height:1.7}
+
+.ph-actions{display:flex;flex-direction:column;gap:10px;width:100%;max-width:320px}
+.ph-btn{display:flex;align-items:center;justify-content:center;gap:9px;padding:14px;border-radius:12px;border:1px solid;font-family:'Rajdhani',sans-serif;font-size:14px;font-weight:700;cursor:pointer;transition:var(--t);letter-spacing:.5px}
+.ph-btn.share{background:rgba(255,53,96,.1);border-color:var(--red);color:var(--red)}
+.ph-btn.share:hover{background:rgba(255,53,96,.2);box-shadow:0 4px 16px var(--redg)}
+.ph-btn.share.active{background:var(--red);color:#fff;animation:shareGlow 2s infinite}
+.ph-btn.stop{background:rgba(74,82,128,.2);border-color:var(--dim);color:var(--dim)}
+.ph-btn.stop:hover{border-color:var(--red);color:var(--red)}
+
+/* ── PC VIEWER ── */
+#pc-viewer{flex-direction:column;background:#000}
+.pv-header{display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--card);border-bottom:1px solid var(--b);flex-shrink:0;z-index:2}
+.pv-logo{font-family:'Orbitron',monospace;font-size:11px;font-weight:700;letter-spacing:2px;color:var(--cyan)}
+.pv-room{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--dim)}
+.pv-sep{flex:1}
+.pv-quality{display:flex;gap:5px}
+.q-btn{padding:3px 8px;border-radius:5px;border:1px solid var(--b);background:transparent;color:var(--dim);font-size:9px;font-weight:700;cursor:pointer;transition:var(--t);font-family:'Rajdhani',sans-serif;letter-spacing:1px}
+.q-btn.active{border-color:var(--cyan);color:var(--cyan);background:rgba(0,245,212,.1)}
+.q-btn:hover{border-color:var(--cyan);color:var(--cyan)}
+.pv-stats{font-size:9px;font-family:'JetBrains Mono',monospace;color:var(--dim)}
+
+.pv-body{flex:1;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;background:#000;cursor:none}
+#remote-video{max-width:100%;max-height:100%;object-fit:contain;display:block}
+.pv-cursor{position:absolute;width:24px;height:24px;pointer-events:none;z-index:10;transform:translate(-50%,-50%);transition:left .04s,top .04s}
+.pv-cursor::before{content:'';position:absolute;inset:0;border:2px solid var(--cyan);border-radius:50%;box-shadow:0 0 10px var(--cyang);animation:cursorPulse 1.5s infinite}
+.pv-cursor::after{content:'';position:absolute;top:50%;left:50%;width:4px;height:4px;background:var(--cyan);border-radius:50%;transform:translate(-50%,-50%)}
+
+.pv-overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px;background:rgba(4,6,15,.9);transition:opacity .3s}
+.pv-overlay.hidden{opacity:0;pointer-events:none}
+.pv-wait-icon{font-size:60px;animation:float 2.5s ease-in-out infinite}
+.pv-wait-text{font-size:14px;color:var(--dim);text-align:center;line-height:1.7}
+.pv-room-show{font-family:'Orbitron',monospace;font-size:28px;font-weight:900;color:var(--cyan);letter-spacing:6px;text-shadow:0 0 20px var(--cyang)}
+
+.pv-toolbar{display:flex;align-items:center;gap:6px;padding:8px 16px;background:var(--card);border-top:1px solid var(--b);flex-shrink:0}
+.tv-btn{display:flex;align-items:center;gap:5px;padding:5px 11px;border-radius:7px;border:1px solid var(--b);background:transparent;color:var(--dim);font-family:'Rajdhani',sans-serif;font-size:11px;font-weight:700;cursor:pointer;transition:var(--t);letter-spacing:.5px}
+.tv-btn:hover{border-color:var(--cyan);color:var(--cyan);background:rgba(0,245,212,.07)}
+.tv-btn.danger:hover{border-color:var(--red);color:var(--red);background:rgba(255,53,96,.07)}
+.tv-sep{flex:1}
+.fps-display{font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--dim)}
+
+/* NOTIFICATION */
+.notif{position:fixed;top:20px;left:50%;transform:translateX(-50%) translateY(-80px);padding:10px 20px;border-radius:10px;background:var(--card2);border:1px solid;font-size:12px;font-weight:700;z-index:9999;transition:transform .3s cubic-bezier(.175,.885,.32,1.275),opacity .3s;opacity:0;letter-spacing:.5px;white-space:nowrap;max-width:90vw}
+.notif.show{transform:translateX(-50%) translateY(0);opacity:1}
+.notif.success{border-color:var(--green);color:var(--green)}
+.notif.info{border-color:var(--cyan);color:var(--cyan)}
+.notif.error{border-color:var(--red);color:var(--red)}
+.notif.warning{border-color:var(--gold);color:var(--gold)}
+
+/* LOADING */
+.loading-overlay{position:fixed;inset:0;background:rgba(4,6,15,.92);display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px;z-index:999;opacity:0;pointer-events:none;transition:opacity .25s}
+.loading-overlay.show{opacity:1;pointer-events:all}
+.spinner{width:44px;height:44px;border:3px solid rgba(0,245,212,.2);border-top-color:var(--cyan);border-radius:50%;animation:spin .8s linear infinite}
+.loading-text{font-size:13px;color:var(--dim);letter-spacing:1px}
+
+/* KEYBOARD PANEL */
+.kb-panel{position:fixed;bottom:0;left:0;right:0;background:var(--card);border-top:1px solid var(--b);padding:12px 14px;z-index:20;transform:translateY(100%);transition:transform .3s cubic-bezier(.4,0,.2,1)}
+.kb-panel.open{transform:translateY(0)}
+.kb-row{display:flex;gap:6px;margin-bottom:6px;justify-content:center;flex-wrap:wrap}
+.kb-key{padding:8px 12px;background:var(--card2);border:1px solid var(--b);border-radius:7px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer;transition:var(--t);min-width:36px;text-align:center;user-select:none}
+.kb-key:hover,.kb-key:active{background:rgba(0,245,212,.12);border-color:var(--cyan);color:var(--cyan)}
+.kb-key.wide{min-width:70px}.kb-key.wider{min-width:120px}
+.kb-inp-row{display:flex;gap:8px;margin-top:8px}
+.kb-type-inp{flex:1;background:var(--bg);border:1px solid var(--b);border-radius:8px;padding:8px 12px;color:var(--text);font-family:'Rajdhani',sans-serif;font-size:13px;outline:none}
+.kb-type-inp:focus{border-color:var(--cyan)}
+.kb-send-btn{padding:8px 16px;background:rgba(0,245,212,.1);border:1px solid var(--b);border-radius:8px;color:var(--cyan);font-family:'Rajdhani',sans-serif;font-weight:700;font-size:12px;cursor:pointer;transition:var(--t)}
+.kb-send-btn:hover{background:rgba(0,245,212,.2)}
+
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes shareGlow{0%,100%{box-shadow:0 4px 16px var(--redg)}50%{box-shadow:0 4px 30px rgba(255,53,96,.6)}}
+@keyframes cursorPulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.2);opacity:.7}}
+@keyframes ripple{to{transform:scale(4);opacity:0}}
+::-webkit-scrollbar{width:3px}::-webkit-scrollbar-thumb{background:var(--b);border-radius:2px}
+</style>
+</head>
+<body>
+
+<!-- ══ LOADING ══ -->
+<div class="loading-overlay" id="loading">
+  <div class="spinner"></div>
+  <div class="loading-text" id="loading-text">Đang kết nối...</div>
+</div>
+
+<!-- ══ NOTIFICATION ══ -->
+<div class="notif" id="notif"></div>
+
+<!-- ══ HOME ══ -->
+<div class="screen" id="home">
+  <div class="home-inner">
+    <div class="logo"><span class="c">REMOTE</span><span class="r">CTRL</span></div>
+    <div class="logo-sub">Điều khiển từ xa · WebRTC</div>
+    <div class="logo-desc">Xem màn hình & điều khiển điện thoại từ máy tính.<br>Không cần cài app — chỉ cần trình duyệt!</div>
+
+    <div class="mode-cards">
+      <div class="mcard phone" onclick="selectRole('phone')">
+        <span class="mcard-icon">📱</span>
+        <div class="mcard-title">ĐIỆN THOẠI</div>
+        <div class="mcard-desc">Mở trên điện thoại<br>Chia sẻ màn hình</div>
+      </div>
+      <div class="mcard pc" onclick="selectRole('pc')">
+        <span class="mcard-icon">🖥️</span>
+        <div class="mcard-title">MÁY TÍNH</div>
+        <div class="mcard-desc">Mở trên PC<br>Xem & điều khiển</div>
+      </div>
+    </div>
+
+    <div id="role-setup" style="display:none">
+      <div class="room-row">
+        <input class="room-inp" id="room-inp" placeholder="Nhập mã phòng..." maxlength="6">
+        <button class="gen-btn" onclick="genRoom()" title="Tạo mã ngẫu nhiên">🎲</button>
+      </div>
+      <button class="conn-btn" id="connect-btn" onclick="connect()">
+        <span id="conn-icon">📱</span>
+        <span id="conn-text">TẠO PHÒNG</span>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ PHONE HOST ══ -->
+<div class="screen hidden" id="phone-host">
+  <div class="ph-header">
+    <div class="ph-title">📱 PHONE HOST</div>
+    <div class="ph-status">
+      <div class="sdot connecting" id="ph-dot"></div>
+      <span id="ph-status-text">Chờ kết nối...</span>
+    </div>
+  </div>
+  <div class="ph-body">
+    <div class="ph-room-display">
+      <div class="room-label">Mã phòng — cho PC nhập vào</div>
+      <div class="room-code" id="ph-room-code">——</div>
+      <div style="font-size:11px;color:var(--dim);margin-top:6px">Mở web này trên PC → chọn "Máy tính" → nhập mã trên</div>
+    </div>
+
+    <div class="ph-waiting" id="ph-waiting">
+      <div class="ph-waiting-icon">⏳</div>
+      <div class="ph-waiting-text">Đang chờ máy tính kết nối...<br><span style="color:var(--cyan)">Giữ màn hình sáng nhé!</span></div>
+    </div>
+
+    <div class="ph-actions">
+      <button class="ph-btn share" id="share-btn" onclick="toggleShare()">
+        <span id="share-icon">📺</span>
+        <span id="share-text">CHIA SẺ MÀN HÌNH</span>
+      </button>
+      <div style="font-size:11px;color:var(--dim);text-align:center;line-height:1.6" id="share-hint">
+        Nhấn để bắt đầu chia sẻ màn hình.<br>
+        ⚠️ Một số điện thoại cần Chrome mới hỗ trợ.
+      </div>
+      <button class="ph-btn stop" onclick="goHome()">← Thoát</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ PC VIEWER ══ -->
+<div class="screen hidden" id="pc-viewer">
+  <div class="pv-header">
+    <div class="pv-logo">REMOTECTRL</div>
+    <div class="pv-room">Room: <span id="pv-room-label" style="color:var(--cyan);font-weight:700">—</span></div>
+    <div class="pv-sep"></div>
+    <div class="pv-quality">
+      <button class="q-btn active" onclick="setQuality(this,'high')">HD</button>
+      <button class="q-btn" onclick="setQuality(this,'medium')">MD</button>
+      <button class="q-btn" onclick="setQuality(this,'low')">LOW</button>
+    </div>
+    <div class="pv-stats" id="pv-stats">—</div>
+  </div>
+
+  <div class="pv-body" id="pv-body" onmousemove="handleMouseMove(event)" onclick="handleClick(event)" oncontextmenu="handleRightClick(event)">
+    <video id="remote-video" autoplay playsinline muted></video>
+    <div class="pv-cursor" id="cursor" style="display:none"></div>
+
+    <!-- Overlay khi chưa có stream -->
+    <div class="pv-overlay" id="pv-overlay">
+      <div class="pv-wait-icon">📡</div>
+      <div class="pv-room-show" id="pv-room-show">——</div>
+      <div class="pv-wait-text">Đang chờ điện thoại chia sẻ màn hình...<br><span style="color:var(--cyan)">Mở web này trên điện thoại → Tạo phòng → Chia sẻ màn hình</span></div>
+    </div>
+  </div>
+
+  <div class="pv-toolbar">
+    <button class="tv-btn" onclick="sendKey('VolumeUp')">🔊</button>
+    <button class="tv-btn" onclick="sendKey('VolumeDown')">🔉</button>
+    <button class="tv-btn" onclick="sendKey('Back')">◀ Back</button>
+    <button class="tv-btn" onclick="sendKey('Home')">⊙ Home</button>
+    <button class="tv-btn" onclick="sendKey('Recent')">⊞ Apps</button>
+    <button class="tv-btn" onclick="toggleKeyboard()">⌨️ Bàn phím</button>
+    <button class="tv-btn" onclick="sendScroll('up')">↑ Cuộn lên</button>
+    <button class="tv-btn" onclick="sendScroll('down')">↓ Cuộn xuống</button>
+    <div class="tv-sep"></div>
+    <div class="fps-display" id="fps-display">FPS: —</div>
+    <button class="tv-btn" onclick="toggleFullscreen()">⛶ Fullscreen</button>
+    <button class="tv-btn danger" onclick="goHome()">✕ Ngắt</button>
+  </div>
+
+  <!-- Keyboard panel -->
+  <div class="kb-panel" id="kb-panel">
+    <div class="kb-row">
+      <div class="kb-key" onclick="sendKey('Escape')">ESC</div>
+      <div class="kb-key" onclick="sendKey('F1')">F1</div>
+      <div class="kb-key" onclick="sendKey('F2')">F2</div>
+      <div class="kb-key" onclick="sendKey('F3')">F3</div>
+      <div class="kb-key" onclick="sendKey('F4')">F4</div>
+      <div class="kb-key" onclick="sendKey('Tab')">TAB</div>
+      <div class="kb-key" onclick="sendKey('CapsLock')">CAPS</div>
+      <div class="kb-key wider" onclick="sendKey('Space')">SPACE</div>
+      <div class="kb-key" onclick="sendKey('Backspace')">⌫</div>
+      <div class="kb-key" onclick="sendKey('Enter')">↵</div>
+    </div>
+    <div class="kb-row">
+      <div class="kb-key" onclick="sendKey('ArrowUp')">↑</div>
+      <div class="kb-key" onclick="sendKey('ArrowDown')">↓</div>
+      <div class="kb-key" onclick="sendKey('ArrowLeft')">←</div>
+      <div class="kb-key" onclick="sendKey('ArrowRight')">→</div>
+      <div class="kb-key wide" onclick="sendKey('ctrl+c')">Ctrl+C</div>
+      <div class="kb-key wide" onclick="sendKey('ctrl+v')">Ctrl+V</div>
+      <div class="kb-key wide" onclick="sendKey('ctrl+z')">Ctrl+Z</div>
+      <div class="kb-key wide" onclick="sendKey('ctrl+a')">Ctrl+A</div>
+    </div>
+    <div class="kb-inp-row">
+      <input class="kb-type-inp" id="kb-type" placeholder="Nhập văn bản để gửi..." onkeydown="if(event.key==='Enter'){sendText(this.value);this.value=''}">
+      <button class="kb-send-btn" onclick="const i=document.getElementById('kb-type');sendText(i.value);i.value=''">GỬI</button>
+      <button class="kb-send-btn" onclick="toggleKeyboard()" style="background:transparent">✕</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Firebase ──
+firebase.initializeApp({
+  apiKey:"AIzaSyCDQsJ_NrGK5ouRLS7vFr55OBZQ0nKhHSk",
+  authDomain:"vietnam-life-game.firebaseapp.com",
+  databaseURL:"https://vietnam-life-game-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId:"vietnam-life-game"
+});
+const db = firebase.database();
+
 // ── ICE Servers (STUN + free TURN) ──
 const ICE_CONFIG = {
   iceServers:[
